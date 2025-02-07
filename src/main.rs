@@ -48,7 +48,7 @@ async fn main() {
         .expect("Could not create Pubsub client");
 
     // channels for communication between tasks
-    let (block_sender, mut block_receiver) = unbounded_channel::<UiConfirmedBlock>();
+    let (block_sender, mut block_receiver) = unbounded_channel::<(UiConfirmedBlock, u64)>();
     let (swap_event_sender, mut swap_event_receiver) = unbounded_channel::<SwapBaseIn>();
 
     let mut join_handles = vec![];
@@ -72,7 +72,7 @@ async fn main() {
 /// The task monitors block updates with Raydium transactions and sends updates to the block channel.
 async fn watch_blocks(
     ps_client: &PubsubClient,
-    block_sender: &UnboundedSender<UiConfirmedBlock>,
+    block_sender: &UnboundedSender<(UiConfirmedBlock, u64)>,
     config: &Config,
 ) -> Result<()> {
     let mut start_slot: u64 = 0;
@@ -94,7 +94,7 @@ async fn watch_blocks(
 
     while let Some(block_update) = block_updates.next().await {
         if let Some(confirmed_block) = block_update.value.block {
-            block_sender.send(confirmed_block)?;
+            block_sender.send((confirmed_block, block_update.value.slot))?;
         }
 
         if start_slot == 0 {
@@ -114,14 +114,14 @@ async fn watch_blocks(
 /// gets only SwapBaseIn events and sends to the swap_events channel
 async fn filter_swap_events(
     config: &Config,
-    block_receiver: &mut UnboundedReceiver<UiConfirmedBlock>,
+    block_receiver: &mut UnboundedReceiver<(UiConfirmedBlock, u64)>,
     swap_events_sender: &UnboundedSender<SwapBaseIn>,
 ) -> Result<()> {
     // I assume that "ray_log" is always next to "Program {} invoke [2]" string in logs
     let search_pattern = format!("Program {} invoke [2]", config.raydium_program_id);
     let prefix_length = 22; // skip prefix "Program log: ray_log: " and get slice starting from log data
 
-    while let Some(block) = block_receiver.recv().await {
+    while let Some((block, slot)) = block_receiver.recv().await {
         block
             .transactions
             .iter()
@@ -143,7 +143,7 @@ async fn filter_swap_events(
                         move |ray_log| match decode_ray_log(&ray_log[prefix_length..]) {
                             Ok(Log::SwapBaseIn(swap_base_in_log)) => Some(SwapBaseIn {
                                 transaction_signature: vt.get_signature().to_string(),
-                                slot: block.parent_slot + 1,
+                                slot,
                                 amount_in: swap_base_in_log.amount_in,
                                 min_amount_out: swap_base_in_log.minimum_out,
                             }),
