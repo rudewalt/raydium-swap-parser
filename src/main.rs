@@ -1,7 +1,7 @@
 mod raydium_logs;
 
 use crate::raydium_logs::{decode_ray_log, Log};
-use anyhow::{Result};
+use anyhow::Result;
 use futures_util::StreamExt;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::rpc_client::SerializableTransaction;
@@ -122,8 +122,7 @@ async fn filter_swap_events(
     let prefix_length = 22; // skip prefix "Program log: ray_log: " and get slice starting from log data
 
     while let Some(block) = block_receiver.recv().await {
-        // iterate over decoded VersionTransaction and log messages
-        for (vt, logs) in block
+        block
             .transactions
             .iter()
             .flat_map(|txs| txs)
@@ -134,30 +133,25 @@ async fn filter_swap_events(
                         .and_then(|meta| meta.log_messages.as_ref().map(|logs| (vt, logs)))
                 })
             })
-        {
-            let signature = vt.get_signature();
-
-            for swap_event in logs
-                .iter()
-                .enumerate()
-                .filter(|(_index, log)| log.eq(&&search_pattern))
-                // use "+1" below, because ray_log next element to ray instruction in array of logs
-                .flat_map(|(index, _)| logs.get(index + 1))
-                .filter_map(|ray_log| {
-                    match decode_ray_log(&ray_log[prefix_length..]) {
-                        Ok(Log::SwapBaseIn(swap_base_in_log)) => Some(SwapBaseIn {
-                            transaction_signature: signature.to_string(),
-                            slot: block.parent_slot + 1,
-                            amount_in: swap_base_in_log.amount_in,
-                            min_amount_out: swap_base_in_log.minimum_out,
-                        }),
-                        _ => None,
-                    }
-                })
-            {
-                swap_events_sender.send(swap_event)?;
-            }
-        }
+            .flat_map(|(vt, logs)| {
+                logs.iter()
+                    .enumerate()
+                    .filter(|(_index, log)| log.eq(&&search_pattern))
+                    // use "+1" below, because ray_log next element to ray instruction in array of logs
+                    .flat_map(|(index, _)| logs.get(index + 1))
+                    .filter_map(
+                        move |ray_log| match decode_ray_log(&ray_log[prefix_length..]) {
+                            Ok(Log::SwapBaseIn(swap_base_in_log)) => Some(SwapBaseIn {
+                                transaction_signature: vt.get_signature().to_string(),
+                                slot: block.parent_slot + 1,
+                                amount_in: swap_base_in_log.amount_in,
+                                min_amount_out: swap_base_in_log.minimum_out,
+                            }),
+                            _ => None,
+                        },
+                    )
+            })
+            .try_for_each(|swap_event| swap_events_sender.send(swap_event))?;
     }
 
     Ok(())
