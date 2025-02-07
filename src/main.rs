@@ -1,11 +1,11 @@
 mod raydium_logs;
 
 use crate::raydium_logs::{decode_ray_log, Log};
-use anyhow::{anyhow, Result};
+use anyhow::{Result};
 use futures_util::StreamExt;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
+use solana_client::rpc_client::SerializableTransaction;
 use solana_client::rpc_config::{RpcBlockSubscribeConfig, RpcBlockSubscribeFilter};
-use solana_transaction_status_client_types::option_serializer::OptionSerializer;
 use solana_transaction_status_client_types::UiConfirmedBlock;
 use std::env;
 use std::io::Write;
@@ -38,7 +38,8 @@ async fn main() {
         ws_url: env::var("WS_URL").expect("WS_URL environment variable not set"),
         raydium_program_id: env::var("PROGRAM_ID").unwrap_or(RAYDIUM_V4.to_string()),
         slot_count: env::var("SLOTS").map_or(DEFAULT_SLOT_COUNT, |v| {
-            v.parse::<u64>().expect("SLOTS environment variable wrong format")
+            v.parse::<u64>()
+                .expect("SLOTS environment variable wrong format")
         }),
         out_file: env::var("OUT_FILE").unwrap_or(DEFAULT_OUT_FILE.to_string()),
     });
@@ -116,45 +117,45 @@ async fn filter_swap_events(
     block_receiver: &mut UnboundedReceiver<UiConfirmedBlock>,
     swap_events_sender: &UnboundedSender<SwapBaseIn>,
 ) -> Result<()> {
-    while let Some(confirmed_block) = block_receiver.recv().await {
-        let search_pattern = format!("Program {} invoke [2]", config.raydium_program_id);
+    // I assume that "ray_log" is always next to "Program {} invoke [2]" string in logs
+    let search_pattern = format!("Program {} invoke [2]", config.raydium_program_id);
+    let prefix_length = 22; // skip prefix "Program log: ray_log: " and get slice starting from log data
 
-        if let Some(txs) = confirmed_block.transactions {
-            for tx in txs.into_iter().filter(|t| t.meta.is_some()) {
-                let meta = tx.meta.unwrap(); //safe, filtered above
+    while let Some(block) = block_receiver.recv().await {
+        // iterate over decoded VersionTransaction and log messages
+        for (vt, logs) in block
+            .transactions
+            .iter()
+            .flat_map(|txs| txs)
+            .filter_map(|tx| {
+                tx.transaction.decode().and_then(|vt| {
+                    tx.meta
+                        .as_ref()
+                        .and_then(|meta| meta.log_messages.as_ref().map(|logs| (vt, logs)))
+                })
+            })
+        {
+            let signature = vt.get_signature();
 
-                if let OptionSerializer::Some(log_messages) = meta.log_messages {
-                    let search_log_result = log_messages.binary_search(&search_pattern);
-
-                    if let Ok(index_of_ray_instruction) = search_log_result {
-                        // use "+1", because ray_log next element to ray instruction in array of logs
-                        if let Some(ray_log) = log_messages.get(index_of_ray_instruction + 1) {
-                            let prefix_length = 22; // skip prefix "Program log: ray_log: " and get slice starting from log data
-
-                            if let Ok(Log::SwapBaseIn(swap_base_in_log)) =
-                                decode_ray_log(&ray_log[prefix_length..])
-                            {
-                                let signature_str = tx
-                                    .transaction
-                                    .decode()
-                                    .ok_or(anyhow!("Couldn't decode encoded transaction"))?
-                                    .signatures
-                                    .first()
-                                    .ok_or(anyhow!("Tx signatures is empty"))?
-                                    .to_string();
-
-                                swap_events_sender.send(SwapBaseIn {
-                                    transaction_signature: signature_str,
-                                    slot: confirmed_block
-                                        .block_height
-                                        .ok_or(anyhow!("Block heigh is None in confirmed block"))?,
-                                    amount_in: swap_base_in_log.amount_in,
-                                    min_amount_out: swap_base_in_log.minimum_out,
-                                })?;
-                            }
-                        }
+            for swap_event in logs
+                .iter()
+                .enumerate()
+                .filter(|(_index, log)| log.eq(&&search_pattern))
+                // use "+1" below, because ray_log next element to ray instruction in array of logs
+                .flat_map(|(index, _)| logs.get(index + 1))
+                .filter_map(|ray_log| {
+                    match decode_ray_log(&ray_log[prefix_length..]) {
+                        Ok(Log::SwapBaseIn(swap_base_in_log)) => Some(SwapBaseIn {
+                            transaction_signature: signature.to_string(),
+                            slot: block.parent_slot + 1,
+                            amount_in: swap_base_in_log.amount_in,
+                            min_amount_out: swap_base_in_log.minimum_out,
+                        }),
+                        _ => None,
                     }
-                }
+                })
+            {
+                swap_events_sender.send(swap_event)?;
             }
         }
     }
