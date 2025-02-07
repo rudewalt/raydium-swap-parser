@@ -38,7 +38,7 @@ async fn main() {
         ws_url: env::var("WS_URL").expect("WS_URL environment variable not set"),
         raydium_program_id: env::var("PROGRAM_ID").unwrap_or(RAYDIUM_V4.to_string()),
         slot_count: env::var("SLOTS").map_or(DEFAULT_SLOT_COUNT, |v| {
-            v.parse::<u64>().expect("SLOTS env variable wrong format")
+            v.parse::<u64>().expect("SLOTS environment variable wrong format")
         }),
         out_file: env::var("OUT_FILE").unwrap_or(DEFAULT_OUT_FILE.to_string()),
     });
