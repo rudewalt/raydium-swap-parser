@@ -134,6 +134,8 @@ async fn filter_swap_events(
                 })
             })
             .flat_map(|(vt, logs)| {
+                let signature = vt.get_signature().to_string();
+
                 logs.iter()
                     .enumerate()
                     .filter(|(_index, log)| log.eq(&&search_pattern))
@@ -142,7 +144,7 @@ async fn filter_swap_events(
                     .filter_map(
                         move |ray_log| match decode_ray_log(&ray_log[prefix_length..]) {
                             Ok(Log::SwapBaseIn(swap_base_in_log)) => Some(SwapBaseIn {
-                                transaction_signature: vt.get_signature().to_string(),
+                                transaction_signature: signature.clone(),
                                 slot,
                                 amount_in: swap_base_in_log.amount_in,
                                 min_amount_out: swap_base_in_log.minimum_out,
