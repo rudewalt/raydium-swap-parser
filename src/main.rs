@@ -6,11 +6,14 @@ use futures_util::StreamExt;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::rpc_client::SerializableTransaction;
 use solana_client::rpc_config::{RpcBlockSubscribeConfig, RpcBlockSubscribeFilter};
-use solana_transaction_status_client_types::UiConfirmedBlock;
+use solana_sdk::transaction::VersionedTransaction;
+use solana_transaction_status_client_types::{EncodedTransactionWithStatusMeta, UiConfirmedBlock};
 use std::env;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+type Slot = u64;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -23,14 +26,30 @@ struct Config {
 #[derive(Debug, serde::Serialize)]
 struct SwapBaseIn {
     pub transaction_signature: String,
-    pub slot: u64,
+    pub slot: Slot,
     pub amount_in: u64,
     pub min_amount_out: u64,
+}
+
+impl SwapBaseIn {
+    fn from_log(log: Log, transaction_signature: String, slot: Slot) -> Option<Self> {
+        match log {
+            Log::SwapBaseIn(sbi) => Some(Self {
+                transaction_signature,
+                slot,
+                amount_in: sbi.amount_in,
+                min_amount_out: sbi.minimum_out,
+            }),
+            _ => None,
+        }
+    }
 }
 
 const RAYDIUM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const DEFAULT_SLOT_COUNT: u64 = 100;
 const DEFAULT_OUT_FILE: &str = "out.json";
+
+const RAYDIUM_V4_LOG_PREFIX_LENGTH: usize = 22; // "Program log: ray_log: ";
 
 #[tokio::main]
 async fn main() {
@@ -43,18 +62,15 @@ async fn main() {
         }),
         out_file: env::var("OUT_FILE").unwrap_or(DEFAULT_OUT_FILE.to_string()),
     });
-    let ps_client = PubsubClient::new(&config.ws_url)
-        .await
-        .expect("Could not create Pubsub client");
 
     // channels for communication between tasks
-    let (block_sender, mut block_receiver) = unbounded_channel::<(UiConfirmedBlock, u64)>();
+    let (block_sender, mut block_receiver) = unbounded_channel::<(UiConfirmedBlock, Slot)>();
     let (swap_event_sender, mut swap_event_receiver) = unbounded_channel::<SwapBaseIn>();
 
     let mut join_handles = vec![];
     join_handles.push(tokio::spawn({
         let config = config.clone();
-        async move { watch_blocks(&ps_client, &block_sender, &config).await }
+        async move { watch_blocks(&block_sender, &config).await }
     }));
     join_handles.push(tokio::spawn({
         let config = config.clone();
@@ -69,13 +85,37 @@ async fn main() {
     futures::future::join_all(join_handles).await;
 }
 
-/// The task monitors block updates with Raydium transactions and sends updates to the block channel.
+/// Attempts to decode encoded transaction and extracts logs from meta.
+/// Returns tuple of decoded transaction and logs
+fn try_decode_transaction_and_get_logs(
+    tx: &EncodedTransactionWithStatusMeta,
+) -> Option<(VersionedTransaction, &Vec<String>)> {
+    tx.transaction.decode().and_then(|vt| {
+        tx.meta
+            .as_ref()
+            .and_then(|meta| meta.log_messages.as_ref().map(|logs| (vt, logs)))
+    })
+}
+
+
+/// Attempts to parse a SwapBaseIn event from a log line.
+fn try_parse_swap_base_in(log: &str, signature: String, slot: Slot) -> Option<SwapBaseIn> {
+    match decode_ray_log(&log[RAYDIUM_V4_LOG_PREFIX_LENGTH..]) {
+        Ok(log) => SwapBaseIn::from_log(log, signature, slot),
+        _ => None,
+    }
+}
+
+/// It subscribes to block updates that mention the given program id,
+/// and then filters out the blocks that don't have transactions.
+/// It then sends the block, and it's slot number to the block channel.
+///
+/// It stops when it reaches the given slot count.
 async fn watch_blocks(
-    ps_client: &PubsubClient,
-    block_sender: &UnboundedSender<(UiConfirmedBlock, u64)>,
+    block_sender: &UnboundedSender<(UiConfirmedBlock, Slot)>,
     config: &Config,
 ) -> Result<()> {
-    let mut start_slot: u64 = 0;
+    let ps_client = PubsubClient::new(&config.ws_url).await?;
 
     let (mut block_updates, block_unsubscribe) = ps_client
         .block_subscribe(
@@ -92,66 +132,56 @@ async fn watch_blocks(
         )
         .await?;
 
+    let mut end_slot: Option<Slot> = None;
     while let Some(block_update) = block_updates.next().await {
+        let current_slot = block_update.value.slot;
         if let Some(confirmed_block) = block_update.value.block {
-            block_sender.send((confirmed_block, block_update.value.slot))?;
+            block_sender.send((confirmed_block, current_slot))?;
         }
 
-        if start_slot == 0 {
-            start_slot = block_update.value.slot;
-        }
-
-        if start_slot + config.slot_count <= block_update.value.slot {
-            let _ = block_unsubscribe().await;
-            break;
+        match end_slot {
+            None => end_slot = Some(current_slot + config.slot_count - 1),
+            Some(target_slot) if current_slot >= target_slot => break,
+            _ => {}
         }
     }
+
+    let _ = block_unsubscribe().await;
 
     Ok(())
 }
 
-/// The task listens the block channel for a new blocks, extracts ray_log, decode it,
-/// gets only SwapBaseIn events and sends to the swap_events channel
+/// It filters out the blocks that don't have transactions,
+/// and then parse the ray logs in the transactions.
+/// It then sends the SwapBaseIn events to the swap_events_sender.
+///
+/// It stops when it reaches the given slot count.
 async fn filter_swap_events(
     config: &Config,
-    block_receiver: &mut UnboundedReceiver<(UiConfirmedBlock, u64)>,
+    block_receiver: &mut UnboundedReceiver<(UiConfirmedBlock, Slot)>,
     swap_events_sender: &UnboundedSender<SwapBaseIn>,
 ) -> Result<()> {
     // I assume that "ray_log" is always next to "Program {} invoke [2]" string in logs
-    let search_pattern = format!("Program {} invoke [2]", config.raydium_program_id);
-    let prefix_length = 22; // skip prefix "Program log: ray_log: " and get slice starting from log data
+    let search_pattern = &format!("Program {} invoke [2]", config.raydium_program_id);
 
     while let Some((block, slot)) = block_receiver.recv().await {
         block
             .transactions
             .iter()
-            .flat_map(|txs| txs)
-            .filter_map(|tx| {
-                tx.transaction.decode().and_then(|vt| {
-                    tx.meta
-                        .as_ref()
-                        .and_then(|meta| meta.log_messages.as_ref().map(|logs| (vt, logs)))
-                })
-            })
+            .flatten()
+            .flat_map(try_decode_transaction_and_get_logs)
             .flat_map(|(vt, logs)| {
                 let signature = vt.get_signature().to_string();
 
-                logs.iter()
-                    .enumerate()
-                    .filter(|(_index, log)| log.eq(&&search_pattern))
-                    // use "+1" below, because ray_log next element to ray instruction in array of logs
-                    .flat_map(|(index, _)| logs.get(index + 1))
-                    .filter_map(
-                        move |ray_log| match decode_ray_log(&ray_log[prefix_length..]) {
-                            Ok(Log::SwapBaseIn(swap_base_in_log)) => Some(SwapBaseIn {
-                                transaction_signature: signature.clone(),
-                                slot,
-                                amount_in: swap_base_in_log.amount_in,
-                                min_amount_out: swap_base_in_log.minimum_out,
-                            }),
-                            _ => None,
-                        },
-                    )
+                // iterate by window with size 2,
+                // assumed that the first row is "program invoke [2]", the second row is ray_log
+                logs.windows(2).filter_map(move |window| {
+                    if window[0].eq(search_pattern) {
+                        try_parse_swap_base_in(&window[1], signature.clone(), slot)
+                    } else {
+                        None
+                    }
+                })
             })
             .try_for_each(|swap_event| swap_events_sender.send(swap_event))?;
     }
@@ -159,7 +189,7 @@ async fn filter_swap_events(
     Ok(())
 }
 
-/// Listen swap_events channel and write it to out file
+/// Writes the received SwapBaseIn events as a json array to a file.
 async fn write_json_result(
     config: &Config,
     swap_event_receiver: &mut UnboundedReceiver<SwapBaseIn>,
@@ -170,6 +200,8 @@ async fn write_json_result(
 
     let mut first = true;
 
+    // Iterate over the swap events, and write each as a json string to the file.
+    // The first event is written with no comma prefix, and the rest are written with a comma prefix.
     while let Some(swap_event) = swap_event_receiver.recv().await {
         let json_str = serde_json::to_string(&swap_event)?;
         if !first {
@@ -181,6 +213,7 @@ async fn write_json_result(
         writer.flush()?;
     }
 
+    // Write the closing bracket of the json array.
     writer.write_all("\n]\n".as_bytes())?;
     writer.flush()?;
 
