@@ -207,7 +207,6 @@ async fn write_json_result(
     let mut first = true;
 
     // Iterate over the swap events, and write each as a json string to the file.
-    // The first event is written with no comma prefix, and the rest are written with a comma prefix.
     while let Some(swap_event) = swap_event_receiver.recv().await {
         let json_str = serde_json::to_string(&swap_event)?;
         if !first {
