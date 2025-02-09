@@ -9,9 +9,10 @@ use solana_client::rpc_config::{RpcBlockSubscribeConfig, RpcBlockSubscribeFilter
 use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status_client_types::{EncodedTransactionWithStatusMeta, UiConfirmedBlock};
 use std::env;
-use std::io::Write;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_util::task::TaskTracker;
 
 type Slot = u64;
 
@@ -49,11 +50,36 @@ const RAYDIUM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const DEFAULT_SLOT_COUNT: u64 = 100;
 const DEFAULT_OUT_FILE: &str = "out.json";
 
-const RAYDIUM_V4_LOG_PREFIX_LENGTH: usize = 22; // "Program log: ray_log: ";
-
 #[tokio::main]
 async fn main() {
-    let config = Arc::new(Config {
+    let config = Arc::new(parse_config());
+    let tracker = TaskTracker::new();
+
+    // channels for communication between tasks
+    let (block_sender, mut block_receiver) = unbounded_channel::<(UiConfirmedBlock, Slot)>();
+    let (swap_event_sender, mut swap_event_receiver) = unbounded_channel::<SwapBaseIn>();
+
+    tracker.spawn({
+        let config = config.clone();
+        async move { watch_blocks(&block_sender, &config).await }
+    });
+    tracker.spawn({
+        let config = config.clone();
+        async move { filter_swap_events(&config, &mut block_receiver, &swap_event_sender).await }
+    });
+
+    tracker.spawn({
+        let config = config.clone();
+        async move { write_json_result(&config, &mut swap_event_receiver).await }
+    });
+
+    tracker.close();
+
+    tracker.wait().await;
+}
+
+fn parse_config() -> Config {
+    Config {
         ws_url: env::var("WS_URL").expect("WS_URL environment variable not set"),
         raydium_program_id: env::var("PROGRAM_ID").unwrap_or(RAYDIUM_V4.to_string()),
         slot_count: env::var("SLOTS").map_or(DEFAULT_SLOT_COUNT, |v| {
@@ -61,28 +87,7 @@ async fn main() {
                 .expect("SLOTS environment variable wrong format")
         }),
         out_file: env::var("OUT_FILE").unwrap_or(DEFAULT_OUT_FILE.to_string()),
-    });
-
-    // channels for communication between tasks
-    let (block_sender, mut block_receiver) = unbounded_channel::<(UiConfirmedBlock, Slot)>();
-    let (swap_event_sender, mut swap_event_receiver) = unbounded_channel::<SwapBaseIn>();
-
-    let mut join_handles = vec![];
-    join_handles.push(tokio::spawn({
-        let config = config.clone();
-        async move { watch_blocks(&block_sender, &config).await }
-    }));
-    join_handles.push(tokio::spawn({
-        let config = config.clone();
-        async move { filter_swap_events(&config, &mut block_receiver, &swap_event_sender).await }
-    }));
-
-    join_handles.push(tokio::spawn({
-        let config = config.clone();
-        async move { write_json_result(&config, &mut swap_event_receiver).await }
-    }));
-
-    futures::future::join_all(join_handles).await;
+    }
 }
 
 /// Attempts to decode encoded transaction and extracts logs from meta.
@@ -97,9 +102,10 @@ fn try_decode_transaction_and_get_logs(
     })
 }
 
-
 /// Attempts to parse a SwapBaseIn event from a log line.
 fn try_parse_swap_base_in(log: &str, signature: String, slot: Slot) -> Option<SwapBaseIn> {
+    const RAYDIUM_V4_LOG_PREFIX_LENGTH: usize = 22; // "Program log: ray_log: ";
+
     match decode_ray_log(&log[RAYDIUM_V4_LOG_PREFIX_LENGTH..]) {
         Ok(log) => SwapBaseIn::from_log(log, signature, slot),
         _ => None,
@@ -140,12 +146,11 @@ async fn watch_blocks(
         }
 
         match end_slot {
-            None => end_slot = Some(current_slot + config.slot_count - 1),
+            None => end_slot = { Some(current_slot + config.slot_count - 1) },
             Some(target_slot) if current_slot >= target_slot => break,
             _ => {}
         }
     }
-
     let _ = block_unsubscribe().await;
 
     Ok(())
@@ -189,14 +194,15 @@ async fn filter_swap_events(
     Ok(())
 }
 
-/// Writes the received SwapBaseIn events as a json array to a file.
+/// Writes received SwapBaseIn events as a json array to a file.
 async fn write_json_result(
     config: &Config,
     swap_event_receiver: &mut UnboundedReceiver<SwapBaseIn>,
 ) -> Result<()> {
-    let file = std::fs::File::create(&config.out_file)?;
-    let mut writer = std::io::BufWriter::new(file);
-    writer.write_all("[\n".as_bytes())?;
+    let file = tokio::fs::File::create(&config.out_file).await?;
+
+    let mut writer = tokio::io::BufWriter::new(file);
+    writer.write_all(b"[\n").await?;
 
     let mut first = true;
 
@@ -205,17 +211,17 @@ async fn write_json_result(
     while let Some(swap_event) = swap_event_receiver.recv().await {
         let json_str = serde_json::to_string(&swap_event)?;
         if !first {
-            writer.write_all(",\n".as_bytes())?;
+            writer.write_all(b",\n").await?;
         }
 
-        writer.write_all(json_str.as_bytes())?;
+        writer.write_all(json_str.as_bytes()).await?;
         first = false;
-        writer.flush()?;
+        writer.flush().await?;
     }
 
     // Write the closing bracket of the json array.
-    writer.write_all("\n]\n".as_bytes())?;
-    writer.flush()?;
+    writer.write_all(b"\n]\n").await?;
+    writer.flush().await?;
 
     Ok(())
 }
