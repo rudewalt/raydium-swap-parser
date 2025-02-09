@@ -10,8 +10,11 @@ use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status_client_types::{EncodedTransactionWithStatusMeta, UiConfirmedBlock};
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::signal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 type Slot = u64;
@@ -54,6 +57,7 @@ const DEFAULT_OUT_FILE: &str = "out.json";
 async fn main() {
     let config = Arc::new(parse_config());
     let tracker = TaskTracker::new();
+    let ct = CancellationToken::new();
 
     // channels for communication between tasks
     let (block_sender, mut block_receiver) = unbounded_channel::<(UiConfirmedBlock, Slot)>();
@@ -61,21 +65,32 @@ async fn main() {
 
     tracker.spawn({
         let config = config.clone();
-        async move { watch_blocks(&block_sender, &config).await }
+        let ct = ct.clone();
+        async move { watch_blocks(&block_sender, &config, ct).await }
     });
     tracker.spawn({
         let config = config.clone();
-        async move { filter_swap_events(&config, &mut block_receiver, &swap_event_sender).await }
+        let ct = ct.clone();
+        async move { filter_swap_events(&config, &mut block_receiver, &swap_event_sender, ct).await }
     });
-
     tracker.spawn({
         let config = config.clone();
-        async move { write_json_result(&config, &mut swap_event_receiver).await }
+        let ct = ct.clone();
+        async move { write_json_result(&config, &mut swap_event_receiver, ct).await }
     });
 
     tracker.close();
 
-    tracker.wait().await;
+    tokio::select! {
+        _= tracker.wait() => {},
+        _ = signal::ctrl_c() => {
+            ct.cancel();
+            match tokio::time::timeout(Duration::from_secs(5), tracker.wait()).await{
+                Ok(_) => println!("Work completed gracefully"),
+                Err(_) => eprintln!("Timed out, forcing shutdown")
+            }
+        },
+    }
 }
 
 fn parse_config() -> Config {
@@ -120,6 +135,7 @@ fn try_parse_swap_base_in(log: &str, signature: String, slot: Slot) -> Option<Sw
 async fn watch_blocks(
     block_sender: &UnboundedSender<(UiConfirmedBlock, Slot)>,
     config: &Config,
+    ct: CancellationToken,
 ) -> Result<()> {
     let ps_client = PubsubClient::new(&config.ws_url).await?;
 
@@ -140,13 +156,17 @@ async fn watch_blocks(
 
     let mut end_slot: Option<Slot> = None;
     while let Some(block_update) = block_updates.next().await {
+        if ct.is_cancelled() {
+            break;
+        }
+
         let current_slot = block_update.value.slot;
         if let Some(confirmed_block) = block_update.value.block {
             block_sender.send((confirmed_block, current_slot))?;
         }
 
         match end_slot {
-            None => end_slot = { Some(current_slot + config.slot_count - 1) },
+            None => end_slot = Some(current_slot + config.slot_count - 1),
             Some(target_slot) if current_slot >= target_slot => break,
             _ => {}
         }
@@ -165,11 +185,16 @@ async fn filter_swap_events(
     config: &Config,
     block_receiver: &mut UnboundedReceiver<(UiConfirmedBlock, Slot)>,
     swap_events_sender: &UnboundedSender<SwapBaseIn>,
+    ct: CancellationToken
 ) -> Result<()> {
     // I assume that "ray_log" is always next to "Program {} invoke [2]" string in logs
     let search_pattern = &format!("Program {} invoke [2]", config.raydium_program_id);
 
     while let Some((block, slot)) = block_receiver.recv().await {
+        if ct.is_cancelled(){
+            break;
+        }
+
         block
             .transactions
             .iter()
@@ -198,6 +223,7 @@ async fn filter_swap_events(
 async fn write_json_result(
     config: &Config,
     swap_event_receiver: &mut UnboundedReceiver<SwapBaseIn>,
+    ct: CancellationToken
 ) -> Result<()> {
     let file = tokio::fs::File::create(&config.out_file).await?;
 
@@ -208,6 +234,10 @@ async fn write_json_result(
 
     // Iterate over the swap events, and write each as a json string to the file.
     while let Some(swap_event) = swap_event_receiver.recv().await {
+        if ct.is_cancelled(){
+            break;
+        }
+
         let json_str = serde_json::to_string(&swap_event)?;
         if !first {
             writer.write_all(b",\n").await?;
